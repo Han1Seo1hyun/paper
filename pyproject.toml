@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ppgs-watermark"
+version = "0.1.0"
+description = "Reference implementation of Proportion-Preserved Gaussian Shading"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+diffusion = [
+  "accelerate>=0.25",
+  "diffusers>=0.27",
+  "pillow>=9.0",
+  "torch>=2.0",
+  "transformers>=4.36",
+]
+test = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
