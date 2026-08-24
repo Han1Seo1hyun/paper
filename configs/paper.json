@@ -1,0 +1,45 @@
+{
+  "models": [
+    "CompVis/stable-diffusion-v1-4",
+    "stabilityai/stable-diffusion-2-base",
+    "stabilityai/stable-diffusion-2-1-base"
+  ],
+  "model_sources": {
+    "stabilityai/stable-diffusion-2-base": "sd-research/stable-diffusion-2-base",
+    "stabilityai/stable-diffusion-2-1-base": "sd-research/stable-diffusion-2-1-base"
+  },
+  "model_variants": {
+    "stabilityai/stable-diffusion-2-base": "fp16",
+    "stabilityai/stable-diffusion-2-1-base": "fp16"
+  },
+  "model_revisions": {
+    "CompVis/stable-diffusion-v1-4": "133a221b8aa7292a167afc5127cb63fb5005638b",
+    "stabilityai/stable-diffusion-2-base": "2dc17a21d44d58938477648126fb00f4374fb493",
+    "stabilityai/stable-diffusion-2-1-base": "0708cecd370b4d1c3a6ff3f7332f5e9aea78896f"
+  },
+  "height": 512,
+  "width": 512,
+  "generation_steps": 50,
+  "inversion_steps": 10,
+  "payload_length": 256,
+  "bits_per_position": 1,
+  "payload_layout": "spatial_tile",
+  "spatial_copies": [1, 8, 8],
+  "public_seed": 2026,
+  "maximum_guidance": 7.5,
+  "minimum_guidance": 0.1,
+  "guidance_decay": 2.0,
+  "guidance_schedule": "exponential",
+  "target_false_positive_rate": 1e-6,
+  "attacks": [
+    "clean",
+    "jpeg",
+    "resize",
+    "noise",
+    "blur",
+    "crop",
+    "rotation",
+    "color",
+    "composite"
+  ]
+}

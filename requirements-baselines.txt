@@ -1,0 +1,6 @@
+# Official image-domain toolkit used for DwtDctSvd and RivaGAN.
+invisible-watermark @ git+https://github.com/ShieldMnt/invisible-watermark.git@68d0376d94a4701ed240af0841ec12e00676e325
+opencv-python-headless>=4.10,<5
+PyWavelets>=1.8,<2
+onnxruntime>=1.20,<2
+scipy>=1.14,<2

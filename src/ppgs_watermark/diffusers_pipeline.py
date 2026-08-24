@@ -7,12 +7,14 @@ only NumPy installed.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+import json
+from pathlib import Path
+from typing import Any, Literal, Sequence
 
 import numpy as np
 
 from .core import EmbeddingMetadata, bit_accuracy, decode_latents, embed_watermark
-from .guidance import guidance_scale
+from .guidance import GuidanceSchedule, guidance_scale
 
 
 @dataclass
@@ -20,6 +22,19 @@ class GenerationResult:
     images: list[Any]
     terminal_latents: Any
     metadata: EmbeddingMetadata
+    settings: dict[str, Any]
+
+    def save_manifest(self, path: str | Path) -> None:
+        """Persist all public information needed for extraction/reproduction."""
+
+        manifest = {
+            "format": "ppgs-generation-v1",
+            "embedding": self.metadata.to_dict(),
+            "generation": self.settings,
+        }
+        Path(path).write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
 
 class PPGSDiffusers:
@@ -56,11 +71,13 @@ class PPGSDiffusers:
         num_inference_steps: int = 50,
         maximum_guidance: float = 7.5,
         guidance_decay: float = 2.0,
-        minimum_guidance: float | None = 0.1,
+        minimum_guidance: float = 0.1,
+        guidance_schedule: GuidanceSchedule = "exponential",
         public_seed: int = 2026,
         sampling_seed: int | None = None,
         bits_per_position: int = 1,
-        repeat_payload: bool = True,
+        payload_layout: Literal["full", "repeat", "spatial_tile"] = "spatial_tile",
+        spatial_copies: tuple[int, int, int] = (1, 8, 8),
     ) -> GenerationResult:
         """Generate with Algorithm 1 sampling and Algorithm 2 guidance."""
 
@@ -79,7 +96,8 @@ class PPGSDiffusers:
             bits_per_position=bits_per_position,
             public_seed=public_seed,
             sampling_seed=sampling_seed,
-            repeat_payload=repeat_payload,
+            payload_layout=payload_layout,
+            spatial_copies=spatial_copies,
         )
 
         prompt_embeds, negative_embeds = self._encode_prompt(prompt, classifier_free=True)
@@ -102,6 +120,7 @@ class PPGSDiffusers:
                     maximum=maximum_guidance,
                     decay=guidance_decay,
                     minimum=minimum_guidance,
+                    schedule=guidance_schedule,
                 )
                 blended = unconditioned + scale * (conditioned - unconditioned)
                 latents = scheduler.step(blended, timestep, latents, eta=0.0).prev_sample
@@ -109,9 +128,26 @@ class PPGSDiffusers:
             scaling = float(pipe.vae.config.scaling_factor)
             decoded = pipe.vae.decode(latents / scaling, return_dict=False)[0]
             images = pipe.image_processor.postprocess(decoded, output_type="pil")
-        return GenerationResult(images, terminal_latents, metadata)
+        settings = {
+            "height": height,
+            "width": width,
+            "num_inference_steps": num_inference_steps,
+            "maximum_guidance": maximum_guidance,
+            "minimum_guidance": minimum_guidance,
+            "guidance_decay": guidance_decay,
+            "guidance_schedule": guidance_schedule,
+            "sampling_seed": sampling_seed,
+            "spatial_copies": list(spatial_copies),
+        }
+        return GenerationResult(images, terminal_latents, metadata, settings)
 
-    def invert(self, image: Any, *, num_inference_steps: int = 10) -> Any:
+    def invert(
+        self,
+        image: Any,
+        *,
+        num_inference_steps: int = 10,
+        metadata: EmbeddingMetadata | None = None,
+    ) -> Any:
         """Encode an image and perform Algorithm 3 null-prompt DDIM inversion."""
 
         import torch
@@ -121,7 +157,14 @@ class PPGSDiffusers:
         scheduler = DDIMInverseScheduler.from_config(pipe.scheduler.config)
         scheduler.set_timesteps(num_inference_steps, device=self.device)
         prompt_embeds, _ = self._encode_prompt("", classifier_free=False)
-        image_tensor = pipe.image_processor.preprocess(image).to(
+        preprocess_kwargs: dict[str, int] = {}
+        if metadata is not None:
+            vae_scale = int(getattr(pipe, "vae_scale_factor", 8))
+            preprocess_kwargs = {
+                "height": metadata.latent_shape[-2] * vae_scale,
+                "width": metadata.latent_shape[-1] * vae_scale,
+            }
+        image_tensor = pipe.image_processor.preprocess(image, **preprocess_kwargs).to(
             device=self.device, dtype=prompt_embeds.dtype
         )
         with torch.no_grad():
@@ -133,6 +176,11 @@ class PPGSDiffusers:
                     model_input, timestep, encoder_hidden_states=prompt_embeds
                 ).sample
                 latents = scheduler.step(prediction, timestep, latents).prev_sample
+        if metadata is not None and tuple(latents.shape) != metadata.latent_shape:
+            raise ValueError(
+                f"inversion produced {tuple(latents.shape)}, expected "
+                f"{metadata.latent_shape}"
+            )
         return latents
 
     @staticmethod

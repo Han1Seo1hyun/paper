@@ -8,8 +8,10 @@ tested without downloading a diffusion model or installing PyTorch.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 from statistics import NormalDist
-from typing import Iterable, Sequence
+from typing import Iterable, Literal, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -31,10 +33,69 @@ class EmbeddingMetadata:
     capacity_bits: int
     gamma: float
     public_seed: int
+    payload_layout: Literal["full", "repeat", "spatial_tile"] = "full"
+    channel_copies: int = 1
+    height_copies: int = 1
+    width_copies: int = 1
 
     @property
     def repetition_count(self) -> int:
+        if self.payload_layout == "spatial_tile":
+            return self.channel_copies * self.height_copies * self.width_copies
         return self.capacity_bits // self.payload_length
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable public extraction manifest."""
+
+        return {
+            "format": "ppgs-embedding-v1",
+            "latent_shape": list(self.latent_shape),
+            "bits_per_position": self.bits_per_position,
+            "payload_length": self.payload_length,
+            "capacity_bits": self.capacity_bits,
+            "gamma": self.gamma,
+            "public_seed": self.public_seed,
+            "payload_layout": self.payload_layout,
+            "channel_copies": self.channel_copies,
+            "height_copies": self.height_copies,
+            "width_copies": self.width_copies,
+        }
+
+    @classmethod
+    def from_dict(cls, values: Mapping[str, object]) -> "EmbeddingMetadata":
+        if values.get("format", "ppgs-embedding-v1") != "ppgs-embedding-v1":
+            raise ValueError("unsupported PPGS metadata format")
+        shape = values.get("latent_shape")
+        if not isinstance(shape, (list, tuple)):
+            raise ValueError("latent_shape is missing from PPGS metadata")
+        layout = str(values.get("payload_layout", "full"))
+        if layout not in {"full", "repeat", "spatial_tile"}:
+            raise ValueError(f"unknown payload layout: {layout}")
+        return cls(
+            latent_shape=tuple(int(v) for v in shape),
+            bits_per_position=int(values["bits_per_position"]),
+            payload_length=int(values["payload_length"]),
+            capacity_bits=int(values["capacity_bits"]),
+            gamma=float(values["gamma"]),
+            public_seed=int(values["public_seed"]),
+            payload_layout=layout,  # type: ignore[arg-type]
+            channel_copies=int(values.get("channel_copies", 1)),
+            height_copies=int(values.get("height_copies", 1)),
+            width_copies=int(values.get("width_copies", 1)),
+        )
+
+    def save(self, path: str | Path) -> None:
+        Path(path).write_text(
+            json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def load(cls, path: str | Path) -> "EmbeddingMetadata":
+        values = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(values, dict):
+            raise ValueError("PPGS metadata must be a JSON object")
+        return cls.from_dict(values)
 
 
 def _as_bits(bits: Iterable[int]) -> NDArray[np.uint8]:
@@ -108,15 +169,20 @@ def embed_watermark(
     bits_per_position: int = 1,
     public_seed: int = 2026,
     sampling_seed: int | None = None,
-    repeat_payload: bool = False,
+    payload_layout: Literal["full", "repeat", "spatial_tile"] = "full",
+    spatial_copies: tuple[int, int, int] = (1, 8, 8),
+    repeat_payload: bool | None = None,
     dtype: np.dtype = np.dtype("float32"),
 ) -> tuple[NDArray[np.floating], EmbeddingMetadata]:
     """Embed bits by proportion-aware inverse-CDF sampling (Algorithm 1).
 
     The paper's algorithm requires one m-bit symbol per latent position. Its
-    experiments also report a 256-bit payload in a 4x64x64 latent. Set
-    ``repeat_payload=True`` for that experimental interpretation: the payload
-    is tiled to capacity and extraction applies majority voting.
+    experiments also report a 256-bit payload in a 4x64x64 latent. Use
+    ``payload_layout="spatial_tile"`` for the Gaussian-Shading experimental
+    interpretation: a 4x8x8 payload is tiled 8x8 across a 4x64x64 latent and
+    extraction applies block-wise majority voting. ``repeat`` preserves the
+    earlier flat repeat interpretation.
+    ``repeat_payload`` remains as a compatibility alias.
     """
 
     bits = _as_bits(watermark)
@@ -128,7 +194,40 @@ def embed_watermark(
 
     positions = int(np.prod(shape))
     capacity = positions * bits_per_position
-    if repeat_payload:
+    if repeat_payload is not None:
+        requested = "repeat" if repeat_payload else "full"
+        if payload_layout != "full" and payload_layout != requested:
+            raise ValueError("payload_layout and repeat_payload disagree")
+        payload_layout = requested
+    if payload_layout not in {"full", "repeat", "spatial_tile"}:
+        raise ValueError(f"unknown payload layout: {payload_layout}")
+
+    copy_factors = tuple(int(value) for value in spatial_copies)
+    if len(copy_factors) != 3 or any(value < 1 for value in copy_factors):
+        raise ValueError("spatial_copies must contain three positive integers")
+
+    if payload_layout == "spatial_tile":
+        if len(shape) not in {3, 4} or (len(shape) == 4 and shape[0] != 1):
+            raise ValueError("spatial_tile requires a CxHxW or 1xCxHxW latent")
+        channels, height, width = shape[-3:]
+        if any(size % copies for size, copies in zip((channels, height, width), copy_factors)):
+            raise ValueError("spatial copy factors must divide C, H, and W")
+        base_shape = tuple(
+            size // copies for size, copies in zip((channels, height, width), copy_factors)
+        )
+        expected_payload = int(np.prod(base_shape)) * bits_per_position
+        if bits.size != expected_payload:
+            raise ValueError(
+                f"spatial_tile expects {expected_payload} bits for base grid "
+                f"{base_shape}, got {bits.size}"
+            )
+        base_symbols = _bits_to_symbols(bits, bits_per_position).reshape(base_shape)
+        tiled_symbols = np.tile(base_symbols, copy_factors).reshape(-1)
+        expanded = _symbols_to_bits(tiled_symbols, bits_per_position)
+        permutation = _public_permutation(capacity, public_seed)
+        permuted = expanded[permutation]
+        symbols = _bits_to_symbols(permuted, bits_per_position)
+    elif payload_layout == "repeat":
         if capacity % bits.size:
             raise ValueError("payload length must divide latent capacity when repeated")
         expanded = np.tile(bits, capacity // bits.size)
@@ -136,14 +235,18 @@ def embed_watermark(
         if bits.size != capacity:
             raise ValueError(
                 f"watermark has {bits.size} bits, but latent capacity is {capacity}; "
-                "pass repeat_payload=True when the payload divides the capacity"
+                "use payload_layout='repeat' when the payload divides the capacity"
             )
         expanded = bits.copy()
 
-    gamma = float(bits.mean())
-    permutation = _public_permutation(capacity, public_seed)
-    permuted = expanded[permutation]
-    symbols = _bits_to_symbols(permuted, bits_per_position)
+    # Equation (12) is defined on the complete sequence mapped into W. The
+    # repeated 256-bit experimental interpretation has the same mean, but
+    # using expanded here also keeps the definition correct for future layouts.
+    gamma = float(expanded.mean())
+    if payload_layout != "spatial_tile":
+        permutation = _public_permutation(capacity, public_seed)
+        permuted = expanded[permutation]
+        symbols = _bits_to_symbols(permuted, bits_per_position)
 
     boundaries = _partition(bits_per_position, gamma)
     lower = boundaries[symbols]
@@ -163,6 +266,10 @@ def embed_watermark(
         capacity_bits=capacity,
         gamma=gamma,
         public_seed=public_seed,
+        payload_layout=payload_layout,
+        channel_copies=copy_factors[0] if payload_layout == "spatial_tile" else 1,
+        height_copies=copy_factors[1] if payload_layout == "spatial_tile" else 1,
+        width_copies=copy_factors[2] if payload_layout == "spatial_tile" else 1,
     )
     return latents, metadata
 
@@ -181,11 +288,52 @@ def decode_latents(
     symbols = np.minimum(symbols, (1 << metadata.bits_per_position) - 1)
     permuted = _symbols_to_bits(symbols.astype(np.int64), metadata.bits_per_position)
 
+    if metadata.payload_layout == "spatial_tile":
+        if len(metadata.latent_shape) not in {3, 4}:
+            raise ValueError("spatial_tile metadata requires CxHxW latent dimensions")
+        channels, height, width = metadata.latent_shape[-3:]
+        factors = (
+            metadata.channel_copies,
+            metadata.height_copies,
+            metadata.width_copies,
+        )
+        if any(size % copies for size, copies in zip((channels, height, width), factors)):
+            raise ValueError("metadata spatial copy factors do not divide latent shape")
+        base_shape = tuple(
+            size // copies for size, copies in zip((channels, height, width), factors)
+        )
+        permutation = _public_permutation(metadata.capacity_bits, metadata.public_seed)
+        expanded = np.empty(metadata.capacity_bits, dtype=np.uint8)
+        expanded[permutation] = permuted
+        bit_grid = expanded.reshape(
+            channels, height, width, metadata.bits_per_position
+        )
+        copies = []
+        for channel_index in range(factors[0]):
+            for height_index in range(factors[1]):
+                for width_index in range(factors[2]):
+                    copies.append(
+                        bit_grid[
+                            channel_index * base_shape[0] : (channel_index + 1)
+                            * base_shape[0],
+                            height_index * base_shape[1] : (height_index + 1)
+                            * base_shape[1],
+                            width_index * base_shape[2] : (width_index + 1)
+                            * base_shape[2],
+                            :,
+                        ]
+                    )
+        votes = np.stack(copies).sum(axis=0)
+        tiled_bits = (votes * 2 >= len(copies)).astype(np.uint8).reshape(-1)
+        return tiled_bits
+
     permutation = _public_permutation(metadata.capacity_bits, metadata.public_seed)
     expanded = np.empty(metadata.capacity_bits, dtype=np.uint8)
     expanded[permutation] = permuted
-    if metadata.repetition_count == 1:
+    if metadata.payload_layout == "full":
         return expanded
+    if metadata.capacity_bits % metadata.payload_length:
+        raise ValueError("repeated payload length does not divide latent capacity")
     votes = expanded.reshape(metadata.repetition_count, metadata.payload_length).sum(axis=0)
     return (votes * 2 >= metadata.repetition_count).astype(np.uint8)
 
